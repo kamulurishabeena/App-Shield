@@ -1,0 +1,119 @@
+# ==============================================================================
+# Python & Bytecode
+# ==============================================================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.dylib
+*.dll
+
+# ==============================================================================
+# Environment Variables & Credentials (NEVER COMMIT SECRETS)
+# ==============================================================================
+.env
+.env.local
+.env.*
+!.env.example
+
+# ==============================================================================
+# Virtual Environments & Packages
+# ==============================================================================
+.venv/
+venv/
+env/
+ENV/
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ==============================================================================
+# IDEs & Code Editors
+# ==============================================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+
+# ==============================================================================
+# Operating System Files
+# ==============================================================================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================================================================
+# Caching & Tool Artifacts
+# ==============================================================================
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.huggingface/
+
+# ==============================================================================
+# Runtime Logs & Databases
+# ==============================================================================
+logs/
+*.log
+*.db
+*.sqlite3
+dump.rdb
+*.pid
+
+# ==============================================================================
+# Test Coverage Reports
+# ==============================================================================
+.coverage
+coverage.xml
+htmlcov/
+
+# ==============================================================================
+# Document Processing Storage (Preserve Directory Layout via .gitkeep)
+# ==============================================================================
+storage/runs/*
+!storage/runs/.gitkeep
+
+storage/uploads/*
+!storage/uploads/.gitkeep
+
+storage/temp/*
+!storage/temp/.gitkeep
+
+storage/ocr/*
+!storage/ocr/.gitkeep
+
+storage/extracted_text/*
+!storage/extracted_text/.gitkeep
+
+storage/redacted/*
+!storage/redacted/.gitkeep
+
+storage/reports/*
+!storage/reports/.gitkeep
+
+benchmarks/output/*
+!benchmarks/output/.gitkeep
+
+uploads/*
+!uploads/.gitkeep
+
+# ==============================================================================
+# Docker & Containers
+# ==============================================================================
+docker-compose.override.yml
+
+# ==============================================================================
+# Temporary Scratch & One-Off Testing Files
+# ==============================================================================
+brain/
+scratch/
+test_pipeline_llm.py
+*.tmp
+*.bak
+*.orig
+node_modules/
+.ipynb_checkpoints/
+opencode.json

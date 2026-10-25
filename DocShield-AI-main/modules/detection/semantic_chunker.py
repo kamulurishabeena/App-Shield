@@ -1,0 +1,357 @@
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+from typing import Any, Sequence
+
+from modules.detection.embedding_service import EmbeddingService
+from modules.detection.models.detection_result import DetectionResult
+
+logger = logging.getLogger(__name__)
+
+# Common section headers in medical, legal, financial, and corporate records
+SECTION_HEADER_PATTERN = re.compile(
+    r"(?im)^(?:[A-Z0-9\s/_\-]{3,40}:|[#*]{1,3}\s+[A-Z][A-Za-z0-9\s/_\-]{2,40}|"
+    r"(?:CHIEF COMPLAINT|HISTORY OF PRESENT ILLNESS|PAST MEDICAL HISTORY|MEDICATIONS|ALLERGIES|"
+    r"PHYSICAL EXAMINATION|LABORATORY DATA|IMPRESSION|PLAN|DIAGNOSIS|DISCHARGE SUMMARY|"
+    r"PAYMENT DETAILS|ACCOUNT SUMMARY|TERMS AND CONDITIONS|EMPLOYMENT DETAILS|PATIENT INFORMATION|"
+    r"BENEFICIARY DETAILS|BILLING INFORMATION)\b)"
+)
+
+
+@dataclass(frozen=True)
+class DocumentChunk:
+    """
+    Represents a logically coherent chunk of text with its global
+    character offsets in the original document.
+    """
+
+    chunk_id: int
+    text: str
+    start_char: int
+    end_char: int
+    section_name: str | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def length(self) -> int:
+        return len(self.text)
+
+
+class SemanticChunker:
+    """
+    Embedding-based semantic chunker designed for PII/PHI document intelligence.
+
+    Uses sentence-transformers/all-MiniLM-L6-v2 embeddings and cosine similarity
+    between adjacent semantic units (paragraphs, table rows, sentences, section headings)
+    to identify natural semantic boundaries while preserving global character coordinates,
+    boundary overlap, and candidate-relevant chunk selection.
+    """
+
+    DEFAULT_TARGET_CHUNK_CHARS = 1500
+    DEFAULT_MAX_CHUNK_CHARS = 2200
+    DEFAULT_MIN_CHUNK_CHARS = 300
+    DEFAULT_OVERLAP_CHARS = 200
+    SIMILARITY_BOUNDARY_THRESHOLD = 0.40
+
+    def __init__(
+        self,
+        target_chunk_chars: int = DEFAULT_TARGET_CHUNK_CHARS,
+        max_chunk_chars: int = DEFAULT_MAX_CHUNK_CHARS,
+        min_chunk_chars: int = DEFAULT_MIN_CHUNK_CHARS,
+        overlap_chars: int = DEFAULT_OVERLAP_CHARS,
+        embedding_service: EmbeddingService | None = None,
+    ):
+        self.target_chunk_chars = target_chunk_chars
+        self.max_chunk_chars = max_chunk_chars
+        self.min_chunk_chars = min_chunk_chars
+        self.overlap_chars = overlap_chars
+        self._embedding_service = embedding_service
+
+    @property
+    def embedding_service(self) -> EmbeddingService:
+        if self._embedding_service is None:
+            self._embedding_service = EmbeddingService.get_instance()
+        return self._embedding_service
+
+    @staticmethod
+    def normalize_text(text: str) -> str:
+        """
+        Normalizes extracted raw text (from OCR/Native PDF extraction):
+        - Standardizes line breaks (\\r\\n, \\r -> \\n).
+        - Removes non-printable control characters, null bytes, and zero-width spaces.
+        - Normalizes Unicode quotation marks, dashes, and non-breaking spaces.
+        - Strips trailing spaces per line and collapses excessive vertical blank lines.
+        """
+        if not text:
+            return ""
+
+        # 1. Unify line breaks
+        normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+
+        # 2. Remove zero-width spaces, BOM, and null bytes
+        for ch in ("\ufeff", "\u200b", "\u200c", "\u200d", "\u200e", "\u200f", "\x00"):
+            normalized = normalized.replace(ch, "")
+
+        # 3. Normalize Unicode quotes, dashes, and non-breaking spaces
+        trans_table = str.maketrans({
+            "\u2018": "'",
+            "\u2019": "'",
+            "\u201c": '"',
+            "\u201d": '"',
+            "\u2014": "-",
+            "\u2013": "-",
+            "\u00a0": " ",
+        })
+        normalized = normalized.translate(trans_table)
+
+        # 4. Clean trailing whitespace on each line
+        lines = [line.rstrip() for line in normalized.split("\n")]
+        normalized = "\n".join(lines)
+
+        # 5. Collapse excessive blank lines (more than 2 consecutive newlines)
+        normalized = re.sub(r"\n{3,}", "\n\n", normalized)
+
+        return normalized.strip()
+
+    def chunk_document(self, text: str) -> list[DocumentChunk]:
+        """
+        Partitions the document text into semantic chunks using embedding-based
+        adjacent similarity with size guardrails and exact global offsets.
+        Guarantees 100% document coverage without character drift.
+        """
+        if not text:
+            return []
+
+        # If document fits in max chunk size, return as a single coherent chunk
+        if len(text) <= self.max_chunk_chars:
+            return [
+                DocumentChunk(
+                    chunk_id=0,
+                    text=text,
+                    start_char=0,
+                    end_char=len(text),
+                )
+            ]
+
+        # 1. Split into atomic semantic units (paragraphs, table rows, section blocks, sentences)
+        units = self._split_into_semantic_units(text)
+        if not units:
+            return [
+                DocumentChunk(
+                    chunk_id=0,
+                    text=text,
+                    start_char=0,
+                    end_char=len(text),
+                )
+            ]
+
+        if len(units) == 1:
+            return [
+                DocumentChunk(
+                    chunk_id=0,
+                    text=text[units[0][0]:units[0][1]],
+                    start_char=units[0][0],
+                    end_char=units[0][1],
+                )
+            ]
+
+        # 2. Compute embeddings for each semantic unit
+        unit_texts = [text[start:end] for start, end in units]
+        unit_embeddings = self.embedding_service.encode(unit_texts)
+
+        # 3. Detect semantic boundary drops via cosine similarity between adjacent units
+        chunks: list[DocumentChunk] = []
+        current_units: list[tuple[int, int]] = [units[0]]
+        current_len = units[0][1] - units[0][0]
+        chunk_id = 0
+
+        for i in range(1, len(units)):
+            next_start, next_end = units[i]
+            next_len = next_end - next_start
+
+            # Calculate adjacent cosine similarity
+            sim = 1.0
+            if len(unit_embeddings) > i:
+                sim = self.embedding_service.cosine_similarity(
+                    unit_embeddings[i - 1],
+                    unit_embeddings[i],
+                )
+
+            # Check boundary conditions
+            is_size_overflow = (current_len + next_len > self.max_chunk_chars)
+            is_semantic_shift = (sim < self.SIMILARITY_BOUNDARY_THRESHOLD and current_len >= self.min_chunk_chars)
+            is_target_reached = (current_len >= self.target_chunk_chars and sim < 0.65)
+
+            if is_size_overflow or is_semantic_shift or is_target_reached:
+                # Finalize current chunk
+                c_start = current_units[0][0]
+                c_end = current_units[-1][1]
+                chunk_text = text[c_start:c_end]
+
+                chunks.append(
+                    DocumentChunk(
+                        chunk_id=chunk_id,
+                        text=chunk_text,
+                        start_char=c_start,
+                        end_char=c_end,
+                    )
+                )
+                chunk_id += 1
+
+                # Overlap retention
+                overlap_accum = 0
+                new_units = []
+                for s_start, s_end in reversed(current_units):
+                    new_units.insert(0, (s_start, s_end))
+                    overlap_accum += (s_end - s_start)
+                    if overlap_accum >= self.overlap_chars:
+                        break
+
+                current_units = new_units
+                current_len = overlap_accum
+
+            current_units.append((next_start, next_end))
+            current_len += next_len
+
+        if current_units:
+            c_start = current_units[0][0]
+            c_end = current_units[-1][1]
+            chunk_text = text[c_start:c_end]
+            chunks.append(
+                DocumentChunk(
+                    chunk_id=chunk_id,
+                    text=chunk_text,
+                    start_char=c_start,
+                    end_char=c_end,
+                )
+            )
+
+        return chunks
+
+    def select_relevant_chunks(
+        self,
+        chunks: list[DocumentChunk],
+        candidates: Sequence[dict[str, Any]],
+        low_confidence_entities: Sequence[DetectionResult] | None = None,
+        resolved_entities: Sequence[DetectionResult] | None = None,
+        max_chunks: int = 10,
+    ) -> list[DocumentChunk]:
+        """
+        Selects chunks that require LLM processing:
+        - Locks high-confidence entity spans, but ensures surrounding chunk text is still sent to LLM.
+        - Chunks with residual candidates, low-confidence entities, or unmasked narrative text are prioritized.
+        - A chunk is only skipped if 100% of its content is covered by a locked span with zero surrounding text.
+        """
+        if not chunks:
+            return []
+
+        resolved = resolved_entities or []
+        high_conf_spans = [
+            (e.start_char, e.end_char)
+            for e in resolved
+            if e.confidence_score >= 0.80
+        ]
+
+        scored_chunks: list[tuple[int, int, DocumentChunk]] = []
+
+        for chunk in chunks:
+            chunk_len = len(chunk.text.strip())
+            if chunk_len == 0:
+                continue
+
+            # Calculate overlap with high-confidence locked spans
+            locked_char_count = 0
+            for start, end in high_conf_spans:
+                overlap = max(0, min(chunk.end_char, end) - max(chunk.start_char, start))
+                locked_char_count += overlap
+
+            unresolved_chars = max(0, chunk_len - locked_char_count)
+
+            # Skip ONLY if 100% covered by locked spans with zero surrounding text
+            if unresolved_chars == 0 and locked_char_count > 0:
+                continue
+
+            # Count candidate intersections
+            candidate_hits = sum(
+                1
+                for c in candidates
+                if max(chunk.start_char, c.get("start", 0)) < min(chunk.end_char, c.get("end", 0))
+            )
+
+            # Count low confidence entity intersections
+            low_conf = low_confidence_entities or []
+            low_conf_hits = sum(
+                1
+                for e in low_conf
+                if max(chunk.start_char, e.start_char) < min(chunk.end_char, e.end_char)
+            )
+
+            # Score prioritizing candidate signals while ensuring all chunks with unresolved text are eligible
+            total_score = (candidate_hits * 3) + (low_conf_hits * 4) + (unresolved_chars // 50) + 1
+            scored_chunks.append((total_score, -chunk.chunk_id, chunk))
+
+        if not scored_chunks:
+            return chunks[:max_chunks]
+
+        # Sort by highest score first, then by earliest chunk order
+        scored_chunks.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        selected = [item[2] for item in scored_chunks[:max_chunks]]
+        # Return in sequential document order
+        selected.sort(key=lambda chunk: chunk.start_char)
+        return selected
+
+    @staticmethod
+    def remap_detection_to_global(
+        detection: DetectionResult,
+        chunk: DocumentChunk,
+    ) -> DetectionResult:
+        """
+        Remaps a DetectionResult with chunk-local character coordinates
+        back to global document character coordinates.
+        """
+        detection.start_char += chunk.start_char
+        detection.end_char += chunk.start_char
+        return detection
+
+    @staticmethod
+    def find_enclosing_chunk(
+        chunks: Sequence[DocumentChunk],
+        start_char: int,
+        end_char: int,
+    ) -> DocumentChunk | None:
+        """
+        Finds the first chunk that fully encloses the given character span.
+        """
+        for chunk in chunks:
+            if chunk.start_char <= start_char and end_char <= chunk.end_char:
+                return chunk
+        return None
+
+    def _split_into_semantic_units(self, text: str) -> list[tuple[int, int]]:
+        """
+        Identifies boundaries by double newlines, section headings, and sentences.
+        Returns a list of (start_idx, end_idx) character spans covering the entire text.
+        """
+        segments: list[tuple[int, int]] = []
+        pos = 0
+        text_len = len(text)
+
+        boundary_pattern = re.compile(
+            r"(?:\r?\n\s*\r?\n|(?<=\n)(?=[A-Z0-9\s/_\-]{3,40}:)|(?<=[.!?])\s+(?=[A-Z]))"
+        )
+
+        for match in boundary_pattern.finditer(text):
+            split_idx = match.start()
+            if split_idx > pos:
+                segments.append((pos, split_idx))
+            pos = match.end()
+
+        if pos < text_len:
+            segments.append((pos, text_len))
+
+        if not segments and text_len > 0:
+            segments.append((0, text_len))
+
+        return segments
